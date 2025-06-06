@@ -1,0 +1,151 @@
+services:
+  minio:
+    image: minio/minio:latest
+    container_name: minio
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio-data:/data
+    environment:
+      MINIO_ROOT_USER: Noureldin
+      MINIO_ROOT_PASSWORD: "Nour123#" # QUOTED
+    command: server --console-address ":9001" /data
+    networks:
+      - app-network
+
+  rabbitmq:
+    image: rabbitmq:3-management
+    container_name: rabbitmq
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    environment:
+      RABBITMQ_DEFAULT_USER: Noureldin
+      RABBITMQ_DEFAULT_PASS: "Nour123#" # QUOTED
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+    networks:
+      - app-network
+
+  srs:
+    image: ossrs/srs:latest
+    container_name: srs
+    ports:
+      - "1935:1935"
+      - "1985:1985"
+      - "8080:8080"
+    volumes:
+      - ./conf/srs.conf:/usr/local/srs/conf/srs.conf
+    restart: unless-stopped
+    networks:
+      - app-network
+
+  ffmpeg-manager:
+    build:
+      context: ./Microservices/FFmpegManager
+    container_name: ffmpeg-manager
+    depends_on:
+      - srs
+    ports:
+      - "5001:5001"
+    restart: unless-stopped
+    networks:
+      - app-network
+
+  ai-pipeline:
+    build:
+      context: ./Microservices/AiPipelineService
+    container_name: ai-pipeline
+    depends_on:
+      - srs
+      - minio
+      - rabbitmq
+    ports:
+      - "8000:8000"
+    environment:
+      PYTHONUNBUFFERED: 1
+    volumes:
+      - ./DockerContainers/hls_output_volume:/tmp/hls_output # Corrected from your diff which had ./DockerContainers/ in path
+    restart: unless-stopped
+    networks:
+      - app-network
+
+  ai-result-handler:
+    container_name: ai-result-handler
+    build:
+      context: ./Microservices/AiResultHandlerService
+      dockerfile: Dockerfile
+    environment:
+      PYTHONUNBUFFERED: "1"
+      CAMERA_ID_TO_PROCESS: "5233342f-bf17-43b6-93a9-7910b5bbaf94"
+      RABBITMQ_HOST: "rabbitmq"
+      RABBITMQ_USER: "Noureldin"
+      RABBITMQ_PASSWORD: "Nour123#"
+      MINIO_URL: "minio:9000"
+      MINIO_ACCESS_KEY: "Noureldin"
+      MINIO_SECRET_KEY: "Nour123#"
+      MINIO_USE_SECURE: "False"
+    depends_on:
+      - rabbitmq
+      - minio
+    networks:
+      - app-network
+    restart: unless-stopped
+
+  dummy-ai-worker:
+    container_name: dummy-ai-worker
+    build:
+      context: ./Microservices/DummyAiWorker
+      dockerfile: Dockerfile
+    environment:
+      PYTHONUNBUFFERED: "1"
+      RABBITMQ_HOST: "rabbitmq"
+      RABBITMQ_USER: "Noureldin"
+      RABBITMQ_PASSWORD: "Nour123#"
+      CAMERA_ID_TO_PROCESS: "5233342f-bf17-43b6-93a9-7910b5bbaf94"
+      MINIO_URL: "minio:9000"
+      MINIO_ACCESS_KEY: "Noureldin"
+      MINIO_SECRET_KEY: "Nour123#"
+      MINIO_USE_SECURE: "False"
+    ports:
+      - "8001:8000"
+    depends_on:
+      - rabbitmq
+      - minio
+    networks:
+      - app-network
+    # restart: unless-stopped # Optional
+
+    # dummy-ai-worker2:
+    #   container_name: dummy-ai-worker2
+    #   build:
+    #     context: ./Microservices/DummyAiWorker
+    #     dockerfile: Dockerfile
+    #   environment:
+    #     PYTHONUNBUFFERED: "1"
+    #     RABBITMQ_HOST: "rabbitmq"
+    #     RABBITMQ_USER: "Noureldin"
+    #     RABBITMQ_PASSWORD: "Nour123#"
+    #     CAMERA_ID_TO_PROCESS: "4b34893d-d9ef-445c-aebf-71ae142051ec"
+    #     MINIO_URL: "minio:9000"
+    #     MINIO_ACCESS_KEY: "Noureldin"
+    #     MINIO_SECRET_KEY: "Nour123#"
+    #     MINIO_USE_SECURE: "False"
+    #   ports:
+    #     - "8002:8000"
+    #   depends_on:
+    #     - rabbitmq
+    #     - minio
+    #   networks:
+    #     - app-network
+    #   # restart: unless-stopped # Optional
+
+volumes:
+  minio-data:
+  rabbitmq-data:
+
+
+networks:
+  app-network:
+    driver: bridge
