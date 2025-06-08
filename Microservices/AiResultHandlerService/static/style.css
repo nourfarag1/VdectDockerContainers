@@ -1,0 +1,113 @@
+/* General Body Styles */
+body {
+    background-color: #0d1a1e; /* Dark, deep green-blue */
+    color: #e0e0e0;
+    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+    margin: 0;
+    padding: 20px;
+}
+
+.container {
+    max-width: 1600px;
+    margin: 0 auto;
+}
+
+header {
+    text-align: center;
+    margin-bottom: 30px;
+    border-bottom: 1px solid #1a535c;
+    padding-bottom: 20px;
+}
+
+header h1 {
+    color: #4ecdc4; /* Bright teal/cyan */
+    margin: 0;
+}
+
+main {
+    display: grid;
+    grid-template-columns: 2fr 1fr;
+    gap: 30px;
+}
+
+.panel {
+    background-color: #1a2a2f;
+    border-radius: 8px;
+    padding: 20px;
+    box-shadow: 0 4px 8px rgba(0, 0, 0, 0.2);
+}
+
+.panel h2 {
+    color: #f7fff7;
+    margin-top: 0;
+    border-bottom: 1px solid #2c4a52;
+    padding-bottom: 10px;
+}
+
+/* Incident Feed Styles */
+.feed-container {
+    max-height: 80vh;
+    overflow-y: auto;
+    padding-right: 10px; /* For scrollbar spacing */
+}
+
+.incident-card {
+    background-color: #0d1a1e;
+    border: 1px solid #1a535c;
+    border-radius: 6px;
+    padding: 15px;
+    margin-bottom: 15px;
+    display: flex;
+    gap: 15px;
+    align-items: center;
+}
+
+.incident-card img.thumbnail {
+    width: 160px;
+    height: 90px;
+    border-radius: 4px;
+    object-fit: cover;
+    background-color: #000;
+}
+
+.incident-details h3 {
+    margin: 0 0 10px 0;
+    color: #4ecdc4;
+}
+
+.incident-details p {
+    margin: 4px 0;
+    font-size: 0.9em;
+}
+
+.download-btn {
+    background-color: #ff6b6b;
+    color: white;
+    text-decoration: none;
+    padding: 8px 12px;
+    border-radius: 4px;
+    font-weight: bold;
+    transition: background-color 0.3s ease;
+}
+
+.download-btn:hover {
+    background-color: #e63946;
+}
+
+/* Log Container Styles */
+.log-container {
+    background-color: #0d1a1e;
+    height: 80vh;
+    overflow-y: scroll;
+    padding: 15px;
+    border-radius: 4px;
+    font-family: 'Courier New', Courier, monospace;
+    font-size: 0.85em;
+    white-space: pre-wrap;
+    border: 1px solid #2c4a52;
+}
+
+.log-entry {
+    padding: 2px 0;
+    border-bottom: 1px dotted #2c4a52;
+} 
