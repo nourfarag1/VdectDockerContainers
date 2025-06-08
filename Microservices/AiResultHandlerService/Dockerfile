@@ -16,5 +16,11 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy the rest of the application's code to the working directory
 COPY . .
 
-# Command to run the application
-CMD ["python", "-u", "main.py"] 
+# Set environment variable for unbuffered output
+ENV PYTHONUNBUFFERED=1
+
+# Expose the port for the Uvicorn web server
+EXPOSE 5003
+
+# The command to run the application using Uvicorn
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "5003"] 

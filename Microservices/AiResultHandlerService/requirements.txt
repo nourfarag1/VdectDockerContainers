@@ -1,3 +1,5 @@
 pika
 minio
+fastapi
+uvicorn
 python-dotenv 

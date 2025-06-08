@@ -89,6 +89,8 @@ services:
     depends_on:
       - rabbitmq
       - minio
+    ports:
+      - "5003:5003"
     networks:
       - app-network
     restart: unless-stopped

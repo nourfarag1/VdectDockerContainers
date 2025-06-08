@@ -152,34 +152,31 @@ def on_message_received_callback(ch, method, properties, body):
         time.sleep(simulated_processing_time_s)
         
         # --- Simulate AI Result and Publish --- 
-        ai_result_type = "no_violence"
-        ai_confidence = random.uniform(0.85, 0.99) # High confidence for no_violence
-        # Simulate a chance of violence detection (e.g., 15% chance)
-        if random.random() < 0.15:
-            ai_result_type = "violence"
-            ai_confidence = random.uniform(0.70, 0.98) # Confidence for violence
-
+        has_violence = random.random() < 0.15
+        
         result_message = {
             "camera_id": metadata.camera_id,
-            "processed_chunk_filename": metadata.chunk_url.split('/')[-1],
-            "minio_path": metadata.chunk_url,
-            "ai_result": ai_result_type,
-            "ai_confidence": round(ai_confidence, 4),
-            "result_timestamp_utc": datetime.utcnow().isoformat() + "Z"
+            "object_name": object_name, # Pass object name
+            "timestamp": datetime.utcnow().isoformat(),
+            "has_violence": has_violence
         }
         
         try:
-            # Ensure the results queue exists (idempotent)
-            ch.queue_declare(queue=RABBITMQ_RESULTS_QUEUE_NAME, durable=True)
+            # The exchange is declared once by the thread that creates the channel.
+            exchange_name = 'ai_results_exchange'
+            # The routing key is what allows the consumer to filter messages.
+            # We'll use the pattern 'ai.results.<camera_id>'
+            routing_key = f"ai.results.{metadata.camera_id}"
+
             ch.basic_publish(
-                exchange='', # Default exchange
-                routing_key=RABBITMQ_RESULTS_QUEUE_NAME,
+                exchange=exchange_name,
+                routing_key=routing_key,
                 body=json.dumps(result_message),
                 properties=pika.BasicProperties(
-                    delivery_mode=pika.spec.PERSISTENT_DELIVERY_MODE # Make message persistent
+                    delivery_mode=pika.spec.PERSISTENT_DELIVERY_MODE
                 )
             )
-            logger.info(f"[{metadata.camera_id}] Published AI result to '{RABBITMQ_RESULTS_QUEUE_NAME}': {ai_result_type}")
+            logger.info(f"[{metadata.camera_id}] Published AI result to exchange '{exchange_name}' with key '{routing_key}': Violence={has_violence}")
         except Exception as pub_e:
             logger.error(f"[{metadata.camera_id}] Failed to publish AI result: {pub_e}", exc_info=True)
         # --- End of AI Result Simulation ---
@@ -194,7 +191,7 @@ def on_message_received_callback(ch, method, properties, body):
             "download_duration_s": round(download_duration, 4),
             "simulated_processing_s": round(simulated_processing_time_s, 4),
             "total_worker_time_s": round(total_worker_time_s, 4),
-            "ai_simulation_result": ai_result_type
+            "ai_simulation_result": "violence" if has_violence else "no_violence"
         }
         global_stats["recent_chunk_stats"].append(chunk_stat)
         global_stats["total_messages_processed"] += 1
@@ -220,12 +217,19 @@ def rabbitmq_consumer_thread_func():
                 pika.ConnectionParameters(host=RABBITMQ_HOST, credentials=credentials, heartbeat=600, blocked_connection_timeout=300)
             )
             channel = connection.channel()
+            # Declare the queue we consume from
             channel.queue_declare(queue=RABBITMQ_QUEUE_NAME, durable=True)
+            
+            # Declare the exchange we will publish results to
+            exchange_name = 'ai_results_exchange'
+            channel.exchange_declare(exchange=exchange_name, exchange_type='topic')
+            logger.info(f"Declared exchange '{exchange_name}' for publishing results.")
+
             global_stats["rabbitmq_status"] = f"Connected to queue '{RABBITMQ_QUEUE_NAME}'"
             logger.info(f"Declared queue '{RABBITMQ_QUEUE_NAME}' and waiting for messages.")
             channel.basic_qos(prefetch_count=1)
             channel.basic_consume(queue=RABBITMQ_QUEUE_NAME, on_message_callback=on_message_received_callback)
-                channel.start_consuming()
+            channel.start_consuming()
         except AMQPConnectionError as e:
             logger.error(f"RabbitMQ connection error: {e}. Retrying in 10s...")
             global_stats["rabbitmq_status"] = f"Connection Error: {e}. Retrying..."

@@ -1,361 +1,266 @@
-from datetime import datetime, timedelta
 import os
 import pika
 import json
 import time
-import sys
-import threading
-import subprocess
-import re
-import shutil
-from pathlib import Path
-from urllib.parse import urlparse
 from minio import Minio
-from dotenv import load_dotenv
+from datetime import datetime
+import logging
+import subprocess
+from threading import Thread, Lock
+from collections import deque
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
+from fastapi.staticfiles import StaticFiles
+import uvicorn
 
-# Load environment variables from .env file for local development
-load_dotenv()
+# --- Configuration ---
+RABBITMQ_HOST = os.environ.get('RABBITMQ_HOST', 'rabbitmq')
+RABBITMQ_USER = os.environ.get('RABBITMQ_USER', 'Noureldin')
+RABBITMQ_PASSWORD = os.environ.get('RABBITMQ_PASSWORD', 'Nour123#')
+MINIO_URL = os.environ.get('MINIO_URL', 'minio:9000')
+MINIO_ACCESS_KEY = os.environ.get('MINIO_ACCESS_KEY', 'Noureldin')
+MINIO_SECRET_KEY = os.environ.get('MINIO_SECRET_KEY', 'Nour123#')
 
-# --- Configuration & Environment Variables ---
-RABBITMQ_HOST = os.getenv('RABBITMQ_HOST', 'rabbitmq')
-RABBITMQ_USER = os.getenv('RABBITMQ_USER', 'guest')
-RABBITMQ_PASS = os.getenv('RABBITMQ_PASSWORD', 'guest')
-MINIO_URL = os.getenv('MINIO_URL', 'minio:9000')
-MINIO_ACCESS_KEY = os.getenv('MINIO_ACCESS_KEY', 'minioadmin')
-MINIO_SECRET_KEY = os.getenv('MINIO_SECRET_KEY', 'minioadmin')
-MINIO_USE_SECURE = os.getenv('MINIO_USE_SECURE', 'False').lower() == 'true'
-EVENT_TIMEOUT_SECONDS = int(os.getenv('EVENT_TIMEOUT_SECONDS', 30)) # Time to wait for next chunk before finalizing
-CAMERA_ID_TO_PROCESS = os.getenv('CAMERA_ID_TO_PROCESS', 'default_camera_id') # The specific camera this instance handles
-SOURCE_BUCKET_NAME = os.getenv('SOURCE_BUCKET_NAME', 'video-chunks')
-EVENTS_BUCKET_NAME = os.getenv('EVENTS_BUCKET_NAME', 'violence-events')
+# --- FastAPI App Initialization ---
+app = FastAPI(title="AI Result Handler")
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
+# --- In-Memory Data Storage (Thread-Safe) ---
+data_lock = Lock()
+MAX_LOG_ENTRIES = 100
+MAX_EVENTS = 50
+system_logs = deque(maxlen=MAX_LOG_ENTRIES)
+detected_events = deque(maxlen=MAX_EVENTS)
+
+# --- Logging Setup ---
+class DequeLogHandler(logging.Handler):
+    def __init__(self, deque_instance):
+        super().__init__()
+        self.deque = deque_instance
+
+    def emit(self, record):
+        log_entry = self.format(record)
+        with data_lock:
+            self.deque.append(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - {log_entry}")
+
+logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
+deque_handler = DequeLogHandler(system_logs)
+logging.getLogger().addHandler(deque_handler)
+logging.info("--- AI Result Handler Service Starting ---")
+
+# --- MinIO and Local Storage Setup ---
+minio_client = Minio(MINIO_URL, access_key=MINIO_ACCESS_KEY, secret_key=MINIO_SECRET_KEY, secure=False)
+RAW_CHUNK_BUCKET = 'video-chunks'
+PROCESSED_VIDEO_BUCKET = 'processed-videos'
+THUMBNAIL_BUCKET = 'thumbnails'
+LOCAL_VIDEO_DIR = 'local_videos'
+LOCAL_THUMBNAIL_DIR = 'local_thumbnails'
+os.makedirs(LOCAL_VIDEO_DIR, exist_ok=True)
+os.makedirs(LOCAL_THUMBNAIL_DIR, exist_ok=True)
+
+for bucket in [RAW_CHUNK_BUCKET, PROCESSED_VIDEO_BUCKET, THUMBNAIL_BUCKET]:
+    if not minio_client.bucket_exists(bucket):
+        minio_client.make_bucket(bucket)
+        logging.info(f"Created MinIO bucket: {bucket}")
 
 # --- State Management ---
-# In-memory dictionary to track active violence events, as per our plan.
-# Key: camera_id
-# Value: a dictionary holding event details.
-# e.g., { "first_violent_chunk": {}, "last_violent_chunk": {}, "chunks_in_event": [], "last_activity_timestamp": time.time() }
-active_events = {}
+camera_data = {}
 
-# --- Client Initialization ---
-try:
-    minio_client = Minio(
-        MINIO_URL,
-        access_key=MINIO_ACCESS_KEY,
-        secret_key=MINIO_SECRET_KEY,
-        secure=MINIO_USE_SECURE
-    )
-    print("Successfully connected to MinIO.")
-except Exception as e:
-    print(f"Error connecting to MinIO: {e}", file=sys.stderr)
-    minio_client = None
+# --- Core Logic Functions (remain the same) ---
+def get_camera_id(body):
+    return body.get('camera_id')
 
-# --- Helper Functions ---
-def get_context_chunk(chunk_metadata, offset_seconds=-5):
-    """
-    Infers the object name for a preceding (N-1) or succeeding (L+1) chunk
-    by adjusting the timestamp in the filename. It verifies the chunk exists in MinIO.
-    """
-    object_name = chunk_metadata.get('object_name')
-    if not object_name:
-        return None
-
-    # Corrected Regex to find the timestamp in the filename (works with full path)
-    match = re.search(r'-(\d{14})\.ts', object_name)
-    if not match:
-        print(f"Could not parse timestamp from chunk name: {object_name}")
-        return None
-
-    timestamp_str = match.group(1)
-    base_name = object_name[:match.start()]
-
+def download_chunk(object_name):
     try:
-        current_dt = datetime.strptime(timestamp_str, '%Y%m%d%H%M%S')
-        context_dt = current_dt + timedelta(seconds=offset_seconds)
-        context_timestamp_str = context_dt.strftime('%Y%m%d%H%M%S')
-
-        # This is a guess. The actual filename might not match this guess perfectly.
-        new_object_name = f"{base_name}-{context_timestamp_str}.ts"
-
-        # Crucial Step: Verify the inferred chunk actually exists before using it.
-        try:
-            minio_client.stat_object(SOURCE_BUCKET_NAME, new_object_name)
-            print(f"Verified context chunk exists in MinIO: {new_object_name}")
-        except Exception:
-            print(f"Inferred context chunk '{new_object_name}' does not exist in MinIO. Skipping.")
-            return None
-
-        # Return a flat message structure consistent with the one from DummyAiWorker
-        return {
-            "object_name": new_object_name,
-            "ai_result": "context",
-            "camera_id": chunk_metadata.get("camera_id"),
-            "minio_path": f"http://{MINIO_URL}/{SOURCE_BUCKET_NAME}/{new_object_name}",
-            "source": "inferred"
-        }
-
-    except Exception as e:
-        print(f"Error during context chunk inference: {e}", file=sys.stderr)
-        return None
-
-def finalize_event(camera_id, event_data):
-    """
-    Finalizes a violence event: downloads chunks, merges them with ffmpeg,
-    uploads the result, and cleans up.
-    """
-    print(f"--- FINALIZING EVENT for camera {camera_id} ---")
-    
-    # Ensure the destination bucket exists
-    try:
-        if not minio_client.bucket_exists(EVENTS_BUCKET_NAME):
-            minio_client.make_bucket(EVENTS_BUCKET_NAME)
-            print(f"Created MinIO bucket: {EVENTS_BUCKET_NAME}")
-    except Exception as e:
-        print(f"Error checking/creating bucket {EVENTS_BUCKET_NAME}: {e}", file=sys.stderr)
-        return
-
-    # Create a temporary local directory to store chunks for merging
-    local_temp_dir = Path(f"/tmp/event_{camera_id}_{int(time.time())}")
-    local_temp_dir.mkdir(parents=True, exist_ok=True)
-    
-    downloaded_chunk_paths = []
-    original_chunks_to_delete = []
-
-    for chunk_message in event_data['chunks_in_event']:
-        # CORRECTED: Get object_name directly from the message
-        object_name = chunk_message.get('object_name')
-        if not object_name:
-            print(f"Skipping chunk with no object_name in message: {chunk_message}")
-            continue
-
-        local_path = local_temp_dir / Path(object_name).name
+        response = minio_client.get_object(RAW_CHUNK_BUCKET, object_name)
+        file_path = os.path.join('/tmp', object_name)
         
-        try:
-            print(f"Downloading {object_name} to {local_path}...")
-            minio_client.fget_object(SOURCE_BUCKET_NAME, object_name, str(local_path))
-            downloaded_chunk_paths.append(str(local_path))
-            original_chunks_to_delete.append(object_name)
-        except Exception as e:
-            print(f"Failed to download chunk {object_name}: {e}", file=sys.stderr)
-            # If a chunk fails to download, we can't create a complete event video.
-            # We should stop and avoid deleting any chunks.
-            return
+        # Ensure the destination directory exists before writing the file
+        os.makedirs(os.path.dirname(file_path), exist_ok=True)
+        
+        with open(file_path, 'wb') as file:
+            file.write(response.read())
+        return file_path
+    except Exception as e:
+        logging.error(f"Failed to download chunk {object_name}: {e}")
+        return None
 
-    if not downloaded_chunk_paths:
-        print("No chunks were downloaded. Aborting event finalization.")
+def generate_thumbnail(video_path, thumbnail_filename):
+    thumbnail_path = os.path.join(LOCAL_THUMBNAIL_DIR, thumbnail_filename)
+    try:
+        subprocess.run([
+            'ffmpeg', '-i', video_path, '-ss', '00:00:01', '-vframes', '1',
+            '-vf', 'scale=320:-1', thumbnail_path, '-y'
+        ], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        logging.info(f"Generated thumbnail: {thumbnail_filename}")
+        return True
+    except subprocess.CalledProcessError as e:
+        logging.error(f"FFmpeg failed to generate thumbnail for {video_path}: {e.stderr.decode()}")
+        return False
+    except Exception as e:
+        logging.error(f"Error generating thumbnail for {video_path}: {e}")
+        return False
+
+def combine_chunks_and_upload(camera_id, chunks_to_process):
+    logging.info(f"[{camera_id}] Combining {len(chunks_to_process)} chunks for processing.")
+    local_chunk_paths = [path for chunk in chunks_to_process if (path := download_chunk(chunk['object_name'])) is not None]
+
+    if not local_chunk_paths:
+        logging.error(f"[{camera_id}] No chunks were downloaded. Aborting combination.")
         return
 
-    # Create the file list for ffmpeg
-    filelist_path = local_temp_dir / "filelist.txt"
-    with open(filelist_path, 'w') as f:
-        for path in downloaded_chunk_paths:
+    timestamp_str = datetime.now().strftime('%Y%m%d_%H%M%S')
+    output_filename = f"incident_{camera_id}_{timestamp_str}.mp4"
+    output_path = os.path.join(LOCAL_VIDEO_DIR, output_filename)
+    
+    file_list_path = f"/tmp/file_list_{camera_id}.txt"
+    with open(file_list_path, 'w') as f:
+        for path in local_chunk_paths:
             f.write(f"file '{path}'\n")
 
-    # Merge with ffmpeg
-    merged_filename = f"event_{camera_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.mp4"
-    merged_filepath = local_temp_dir / merged_filename
-    ffmpeg_command = [
-        'ffmpeg',
-        '-f', 'concat',
-        '-safe', '0',
-        '-i', str(filelist_path),
-        '-c', 'copy',
-        str(merged_filepath)
-    ]
-
     try:
-        print(f"Running ffmpeg to merge {len(downloaded_chunk_paths)} chunks...")
-        subprocess.run(ffmpeg_command, check=True, capture_output=True, text=True)
-        print(f"Successfully merged video to {merged_filepath}")
+        subprocess.run(['ffmpeg', '-f', 'concat', '-safe', '0', '-i', file_list_path, '-c', 'copy', output_path, '-y'], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        logging.info(f"[{camera_id}] Successfully combined video: {output_filename}")
+        minio_client.fput_object(PROCESSED_VIDEO_BUCKET, output_filename, output_path)
+        logging.info(f"[{camera_id}] Uploaded combined video to MinIO bucket '{PROCESSED_VIDEO_BUCKET}'.")
 
-        # Upload the merged video to MinIO
-        minio_client.fput_object(
-            EVENTS_BUCKET_NAME,
-            merged_filename,
-            str(merged_filepath),
-            content_type='video/mp4'
-        )
-        print(f"Successfully uploaded {merged_filename} to bucket {EVENTS_BUCKET_NAME}")
+        thumbnail_filename = output_filename.replace('.mp4', '.jpg')
+        if generate_thumbnail(output_path, thumbnail_filename):
+            minio_client.fput_object(THUMBNAIL_BUCKET, thumbnail_filename, os.path.join(LOCAL_THUMBNAIL_DIR, thumbnail_filename))
+            logging.info(f"Uploaded thumbnail to MinIO: {thumbnail_filename}")
 
-        # --- Cleanup ---
-        # print("Cleaning up original chunks...")
-        # for object_name in original_chunks_to_delete:
-        #     try:
-        #         minio_client.remove_object(SOURCE_BUCKET_NAME, object_name)
-        #         print(f"  -> Deleted {object_name}")
-        #     except Exception as e:
-        #         print(f"  -> Failed to delete {object_name}: {e}", file=sys.stderr)
+        with data_lock:
+            detected_events.append({
+                'camera_id': camera_id, 'timestamp': datetime.now().isoformat(),
+                'video_filename': output_filename, 'video_url': f'/videos/{output_filename}',
+                'thumbnail_url': f'/thumbnails/{thumbnail_filename}'
+            })
 
     except subprocess.CalledProcessError as e:
-        print(f"ffmpeg failed with exit code {e.returncode}", file=sys.stderr)
-        print(f"ffmpeg stderr: {e.stderr}", file=sys.stderr)
+        logging.error(f"[{camera_id}] FFmpeg failed during chunk combination: {e.stderr.decode()}")
     except Exception as e:
-        print(f"An error occurred during ffmpeg processing or upload: {e}", file=sys.stderr)
+        logging.error(f"[{camera_id}] An error occurred during video processing: {e}")
     finally:
-        # Clean up local temporary files robustly
-        try:
-            if local_temp_dir.exists():
-                shutil.rmtree(local_temp_dir)
-                print(f"Cleaned up local temporary directory: {local_temp_dir}")
-        except Exception as e:
-            print(f"Error during temporary directory cleanup: {e}", file=sys.stderr)
-    
-    print(f"--- END OF EVENT for camera {camera_id} ---")
+        for path in local_chunk_paths: os.remove(path)
+        if os.path.exists(file_list_path): os.remove(file_list_path)
 
-def connect_to_rabbitmq():
-    """Establishes a connection to RabbitMQ, with retries."""
-    credentials = pika.PlainCredentials(RABBITMQ_USER, RABBITMQ_PASS)
+def process_message(body):
+    camera_id = get_camera_id(body)
+    if not camera_id:
+        logging.warning("Received message without a camera_id.")
+        return
+
+    if camera_id not in camera_data:
+        camera_data[camera_id] = {'violence_detected': False, 'chunks_buffer': deque(maxlen=10), 'chunks_since_violence': 0}
+    
+    state = camera_data[camera_id]
+    chunk_info = {'timestamp': datetime.fromisoformat(body['timestamp']), 'object_name': body['object_name'], 'has_violence': body['has_violence']}
+    logging.info(f"[{camera_id}] Received chunk {chunk_info['object_name']}. Violence: {chunk_info['has_violence']}")
+    state['chunks_buffer'].append(chunk_info)
+
+    # If a violence chunk is detected, reset the countdown and wait for post-violence chunks.
+    if chunk_info['has_violence']:
+        state['violence_detected'] = True
+        state['chunks_since_violence'] = 0
+        logging.info(f"[{camera_id}] Violence detected. Resetting/starting 2-chunk post-violence countdown.")
+        return 
+
+    # If we are in "violence detected" mode, check if the countdown is over.
+    if state['violence_detected']:
+        state['chunks_since_violence'] += 1
+        
+        # If we have received 2 non-violent chunks after the last violent one, process the video.
+        if state['chunks_since_violence'] >= 2:
+            logging.info(f"[{camera_id}] Post-violence countdown finished. Processing incident video.")
+            
+            violence_indices = [i for i, chunk in enumerate(state['chunks_buffer']) if chunk['has_violence']]
+            
+            if not violence_indices:
+                logging.warning(f"[{camera_id}] Inconsistent state: violence_detected is True, but no violence chunks in buffer. Resetting.")
+            else:
+                first_violence_idx = violence_indices[0]
+                last_violence_idx = violence_indices[-1]
+
+                # Define window: 1 chunk before the first violence, and 2 chunks after the last one.
+                start_idx = max(0, first_violence_idx - 1)
+                end_idx = min(len(state['chunks_buffer']), last_violence_idx + 3)
+                
+                chunks_to_process = list(state['chunks_buffer'])[start_idx:end_idx]
+                combine_chunks_and_upload(camera_id, chunks_to_process)
+
+            # Reset state for the next event.
+            state['violence_detected'] = False
+            state['chunks_since_violence'] = 0
+            state['chunks_buffer'].clear()
+
+def rabbitmq_consumer_thread_func():
+    logging.info("RabbitMQ consumer thread starting.")
     while True:
         try:
-            connection = pika.BlockingConnection(
-                pika.ConnectionParameters(host=RABBITMQ_HOST, credentials=credentials)
-            )
-            print("Successfully connected to RabbitMQ.")
-            return connection
-        except pika.exceptions.AMQPConnectionError:
-            print("Could not connect to RabbitMQ, retrying in 5 seconds...")
+            credentials = pika.PlainCredentials(RABBITMQ_USER, RABBITMQ_PASSWORD)
+            connection = pika.BlockingConnection(pika.ConnectionParameters(host=RABBITMQ_HOST, credentials=credentials, heartbeat=600))
+            channel = connection.channel()
+            exchange_name = 'ai_results_exchange'
+            channel.exchange_declare(exchange=exchange_name, exchange_type='topic')
+            result = channel.queue_declare(queue='', exclusive=True)
+            queue_name = result.method.queue
+            binding_key = "ai.results.*" 
+            channel.queue_bind(exchange=exchange_name, queue=queue_name, routing_key=binding_key)
+            logging.info(f"RabbitMQ consumer connected. Waiting for messages on binding key '{binding_key}'.")
+
+            def callback(ch, method, properties, body):
+                try:
+                    process_message(json.loads(body))
+                except Exception as e:
+                    logging.error(f"Error in message callback: {e}")
+                finally:
+                    ch.basic_ack(delivery_tag=method.delivery_tag)
+
+            channel.basic_consume(queue=queue_name, on_message_callback=callback)
+            channel.start_consuming()
+        except pika.exceptions.AMQPConnectionError as e:
+            logging.error(f"RabbitMQ connection failed: {e}. Retrying in 5 seconds...")
+            time.sleep(5)
+        except Exception as e:
+            logging.error(f"Unhandled exception in RabbitMQ thread: {e}")
             time.sleep(5)
 
-def message_callback(ch, method, properties, body):
-    """Callback function to process messages from the AI results queue."""
+# --- FastAPI Routes ---
+@app.get("/", response_class=HTMLResponse)
+async def get_ui():
     try:
-        message = json.loads(body)
-        
-        # Get camera_id from message body, as we listen to a specific queue now
-        camera_id = message.get('camera_id')
-        if not camera_id:
-            print("Received message without a camera_id. Discarding.", file=sys.stderr)
-            ch.basic_ack(delivery_tag=method.delivery_tag)
-            return
+        with open("templates/index.html") as f:
+            return HTMLResponse(content=f.read())
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="index.html not found")
 
-        ai_result = message.get('ai_result')
+@app.get("/api/data", response_class=JSONResponse)
+async def api_data():
+    with data_lock:
+        return JSONResponse(content={
+            'logs': list(system_logs),
+            'events': list(detected_events)
+        })
 
-        # --- FIX: Derive object_name from minio_path and treat message as the metadata ---
-        minio_path = message.get('minio_path')
-        if not minio_path:
-            print("Received message without 'minio_path'. Discarding.", file=sys.stderr)
-            ch.basic_ack(delivery_tag=method.delivery_tag)
-            return
-        
-        try:
-            # The object name is the path part of the URL, minus the leading bucket name.
-            # e.g., /video-chunks/camera_....ts -> camera_....ts
-            parsed_path = urlparse(minio_path).path
-            object_name = '/'.join(parsed_path.strip('/').split('/')[1:])
-            message['object_name'] = object_name
-        except Exception as e:
-            print(f"Could not parse object_name from minio_path '{minio_path}': {e}", file=sys.stderr)
-            ch.basic_ack(delivery_tag=method.delivery_tag)
-            return
+@app.get("/videos/{filename:path}")
+async def serve_video(filename: str):
+    video_path = os.path.join(LOCAL_VIDEO_DIR, filename)
+    if not os.path.exists(video_path):
+        return HTTPException(status_code=404, detail="Video not found")
+    return FileResponse(video_path)
 
-        # Use the modified message itself as the chunk_metadata
-        chunk_metadata = message
+@app.get("/thumbnails/{filename:path}")
+async def serve_thumbnail(filename: str):
+    thumbnail_path = os.path.join(LOCAL_THUMBNAIL_DIR, filename)
+    if not os.path.exists(thumbnail_path):
+        return HTTPException(status_code=404, detail="Thumbnail not found")
+    return FileResponse(thumbnail_path, media_type="image/jpeg")
 
-        print(f"Received '{ai_result}' for camera {camera_id}, chunk: {chunk_metadata.get('object_name')}")
+# --- App Startup ---
+@app.on_event("startup")
+async def startup_event():
+    consumer_thread = Thread(target=rabbitmq_consumer_thread_func, daemon=True)
+    consumer_thread.start()
 
-        event = active_events.get(camera_id)
-
-        if ai_result == 'violence':
-            if not event:
-                # Start of a new event. Try to get the preceding chunk (N-1).
-                print(f"Starting new violence event for camera {camera_id}.")
-                pre_event_chunk = get_context_chunk(chunk_metadata, offset_seconds=-5)
-                
-                initial_chunks = []
-                if pre_event_chunk:
-                    print(f"Found pre-event context chunk: {pre_event_chunk.get('object_name')}")
-                    initial_chunks.append(pre_event_chunk)
-                
-                initial_chunks.append(message)
-
-                active_events[camera_id] = {
-                    'first_violent_chunk': chunk_metadata,
-                    'last_violent_chunk': chunk_metadata,
-                    'chunks_in_event': initial_chunks,
-                    'last_activity_timestamp': time.time()
-                }
-            else:
-                # Continuing an existing event
-                print(f"Continuing violence event for camera {camera_id}.")
-                event['chunks_in_event'].append(message)
-                event['last_violent_chunk'] = chunk_metadata
-                event['last_activity_timestamp'] = time.time()
-
-        elif ai_result == 'no_violence':
-            if event:
-                # End of a violence event. This is our L+1 chunk.
-                print(f"Received 'no_violence' signal, finalizing event for camera {camera_id}.")
-                event['chunks_in_event'].append(message)
-                finalize_event(camera_id, event)
-                del active_events[camera_id]
-            else:
-                # Standalone 'no_violence' chunk, not part of an event.
-                # TODO: Implement logic to delete this chunk from MinIO to save space.
-                print(f"Received standalone 'no_violence' for camera {camera_id}. No active event.")
-
-        ch.basic_ack(delivery_tag=method.delivery_tag)
-
-    except json.JSONDecodeError as e:
-        print(f"Error decoding message body: {e}", file=sys.stderr)
-        ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False) # Discard poison message
-    except Exception as e:
-        print(f"An unexpected error occurred in callback: {e}", file=sys.stderr)
-        ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
-
-def check_for_timeouts():
-    """Periodically checks for and finalizes timed-out events."""
-    while True:
-        time.sleep(10) # Check every 10 seconds
-        now = time.time()
-        
-        # Create a copy of items to avoid issues with modifying dict during iteration
-        for camera_id, event in list(active_events.items()):
-            if (now - event['last_activity_timestamp']) > EVENT_TIMEOUT_SECONDS:
-                print(f"Event for camera {camera_id} has timed out. Finalizing.")
-                # Try to infer the next chunk (L+1) after the last known violent one.
-                post_event_chunk = get_context_chunk(event['last_violent_chunk'], offset_seconds=5)
-                if post_event_chunk:
-                    print(f"Found post-event context chunk on timeout: {post_event_chunk.get('object_name')}")
-                    event['chunks_in_event'].append(post_event_chunk)
-
-                finalize_event(camera_id, event)
-                del active_events[camera_id]
-
-def main():
-    """Main function to set up RabbitMQ and start consuming messages."""
-    if not minio_client:
-        print("Cannot start service, MinIO client is not initialized.", file=sys.stderr)
-        sys.exit(1)
-
-    # Start the timeout checker in a background thread
-    # The 'daemon=True' ensures the thread will exit when the main program exits.
-    timeout_thread = threading.Thread(target=check_for_timeouts, daemon=True)
-    timeout_thread.start()
-    print("Event timeout checker started in background.")
-
-    connection = connect_to_rabbitmq()
-    channel = connection.channel()
-
-    # This service consumes results directly from a queue dedicated to a specific camera.
-    queue_name = f"ai.results.{CAMERA_ID_TO_PROCESS}"
-
-    print(f"AiResultHandlerService instance is configured to listen on queue: '{queue_name}'")
-    
-    channel.queue_declare(queue=queue_name, durable=True)
-    
-    channel.basic_qos(prefetch_count=1)
-    channel.basic_consume(queue=queue_name, on_message_callback=message_callback)
-
-    print(f"[*] AiResultHandlerService waiting for messages. To exit press CTRL+C")
-    
-    try:
-        channel.start_consuming()
-    except KeyboardInterrupt:
-        print("Interrupted. Closing connection...")
-        connection.close()
-    except Exception as e:
-        print(f"A critical error occurred: {e}", file=sys.stderr)
-        if connection.is_open:
-            connection.close()
-
-if __name__ == '__main__':
-    main() 
+if __name__ == "__main__":
+    uvicorn.run("main:app", host="0.0.0.0", port=5003, reload=True) 
