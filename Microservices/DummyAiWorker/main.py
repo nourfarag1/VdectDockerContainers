@@ -30,14 +30,18 @@ RABBITMQ_HOST = os.getenv("RABBITMQ_HOST", "rabbitmq")
 RABBITMQ_PORT = int(os.getenv("RABBITMQ_PORT", 5672))
 RABBITMQ_USER = os.getenv("RABBITMQ_USER", "Noureldin")
 RABBITMQ_PASS = os.getenv("RABBITMQ_PASS", "Nour123#")
-# Define CAMERA_ID_TO_PROCESS for clarity and to form the default queue name
-CAMERA_ID_TO_PROCESS = os.getenv("CAMERA_ID_TO_PROCESS", "default_camera_id") 
-# Set RABBITMQ_QUEUE_NAME, defaulting to the pattern ai.camera.{CAMERA_ID_TO_PROCESS}
-# This allows overriding the full queue name via env var if needed for special cases.
-RABBITMQ_QUEUE_NAME = os.getenv("RABBITMQ_QUEUE_NAME", f"ai.camera.{CAMERA_ID_TO_PROCESS}")
-# New: Define the queue for publishing AI results
-RABBITMQ_RESULTS_QUEUE_NAME_TEMPLATE = os.getenv("RABBITMQ_RESULTS_QUEUE_NAME_TEMPLATE", "ai.results.{camera_id}")
-RABBITMQ_RESULTS_QUEUE_NAME = RABBITMQ_RESULTS_QUEUE_NAME_TEMPLATE.format(camera_id=CAMERA_ID_TO_PROCESS)
+
+# This is the single, shared queue this worker will pull from.
+RABBITMQ_CONSUME_QUEUE_NAME = "ai_processing_queue"
+# This is the exchange that the ai-pipeline publishes to.
+RABBITMQ_CONSUME_EXCHANGE_NAME = "ai_camera_exchange"
+# The binding key to get all camera messages.
+RABBITMQ_CONSUME_BINDING_KEY = "ai.camera.*"
+
+# New: Define the queue for publishing AI results - This part remains mostly the same conceptually
+RABBITMQ_RESULTS_EXCHANGE_NAME = "ai_results_exchange" # Changed for clarity
+RABBITMQ_RESULTS_ROUTING_KEY_TEMPLATE = "ai.results.{camera_id}" # Changed for clarity
+
 RABBITMQ_MANAGEMENT_PORT = int(os.getenv("RABBITMQ_MANAGEMENT_PORT", 15672)) # New
 RABBITMQ_VHOST = os.getenv("RABBITMQ_VHOST", "/") # New (ensure it's URL encoded if needed for API calls)
 
@@ -163,10 +167,10 @@ def on_message_received_callback(ch, method, properties, body):
         
         try:
             # The exchange is declared once by the thread that creates the channel.
-            exchange_name = 'ai_results_exchange'
+            exchange_name = RABBITMQ_RESULTS_EXCHANGE_NAME
             # The routing key is what allows the consumer to filter messages.
             # We'll use the pattern 'ai.results.<camera_id>'
-            routing_key = f"ai.results.{metadata.camera_id}"
+            routing_key = RABBITMQ_RESULTS_ROUTING_KEY_TEMPLATE.format(camera_id=metadata.camera_id)
 
             ch.basic_publish(
                 exchange=exchange_name,
@@ -217,18 +221,25 @@ def rabbitmq_consumer_thread_func():
                 pika.ConnectionParameters(host=RABBITMQ_HOST, credentials=credentials, heartbeat=600, blocked_connection_timeout=300)
             )
             channel = connection.channel()
-            # Declare the queue we consume from
-            channel.queue_declare(queue=RABBITMQ_QUEUE_NAME, durable=True)
+
+            # Declare the exchange we will consume from (published by ai-pipeline)
+            channel.exchange_declare(exchange=RABBITMQ_CONSUME_EXCHANGE_NAME, exchange_type='topic', durable=True)
+            
+            # Declare the durable queue that will receive the messages
+            channel.queue_declare(queue=RABBITMQ_CONSUME_QUEUE_NAME, durable=True)
+
+            # Bind the queue to the exchange with our wildcard routing key
+            channel.queue_bind(exchange=RABBITMQ_CONSUME_EXCHANGE_NAME, queue=RABBITMQ_CONSUME_QUEUE_NAME, routing_key=RABBITMQ_CONSUME_BINDING_KEY)
+            logger.info(f"Bound queue '{RABBITMQ_CONSUME_QUEUE_NAME}' to exchange '{RABBITMQ_CONSUME_EXCHANGE_NAME}' with key '{RABBITMQ_CONSUME_BINDING_KEY}'")
             
             # Declare the exchange we will publish results to
-            exchange_name = 'ai_results_exchange'
-            channel.exchange_declare(exchange=exchange_name, exchange_type='topic')
-            logger.info(f"Declared exchange '{exchange_name}' for publishing results.")
+            channel.exchange_declare(exchange=RABBITMQ_RESULTS_EXCHANGE_NAME, exchange_type='topic', durable=True)
+            logger.info(f"Declared exchange '{RABBITMQ_RESULTS_EXCHANGE_NAME}' for publishing results.")
 
-            global_stats["rabbitmq_status"] = f"Connected to queue '{RABBITMQ_QUEUE_NAME}'"
-            logger.info(f"Declared queue '{RABBITMQ_QUEUE_NAME}' and waiting for messages.")
+            global_stats["rabbitmq_status"] = f"Connected, consuming from '{RABBITMQ_CONSUME_QUEUE_NAME}'"
+            logger.info(f"Waiting for messages on queue '{RABBITMQ_CONSUME_QUEUE_NAME}'.")
             channel.basic_qos(prefetch_count=1)
-            channel.basic_consume(queue=RABBITMQ_QUEUE_NAME, on_message_callback=on_message_received_callback)
+            channel.basic_consume(queue=RABBITMQ_CONSUME_QUEUE_NAME, on_message_callback=on_message_received_callback)
             channel.start_consuming()
         except AMQPConnectionError as e:
             logger.error(f"RabbitMQ connection error: {e}. Retrying in 10s...")
@@ -307,7 +318,7 @@ async def get_rabbitmq_management_stats(session: aiohttp.ClientSession) -> Dict[
     """
     rates = {"publish_rate": 0.0, "ack_rate": 0.0}
     vhost = RABBITMQ_VHOST if RABBITMQ_VHOST != "/" else "%2F" # URL encode default vhost
-    url = f"http://{RABBITMQ_HOST}:{RABBITMQ_MANAGEMENT_PORT}/api/queues/{vhost}/{RABBITMQ_QUEUE_NAME}"
+    url = f"http://{RABBITMQ_HOST}:{RABBITMQ_MANAGEMENT_PORT}/api/queues/{vhost}/{RABBITMQ_CONSUME_QUEUE_NAME}"
     auth = aiohttp.BasicAuth(RABBITMQ_USER, RABBITMQ_PASS)
 
     try:
@@ -339,11 +350,11 @@ async def get_rabbitmq_management_stats(session: aiohttp.ClientSession) -> Dict[
 
 
             else:
-                logger.warning(f"Failed to fetch RabbitMQ management stats: {response.status} for queue {RABBITMQ_QUEUE_NAME}")
+                logger.warning(f"Failed to fetch RabbitMQ management stats: {response.status} for queue {RABBITMQ_CONSUME_QUEUE_NAME}")
     except aiohttp.ClientError as e:
         logger.error(f"Error fetching RabbitMQ management stats: {e}")
     except asyncio.TimeoutError:
-        logger.error(f"Timeout fetching RabbitMQ management stats for queue {RABBITMQ_QUEUE_NAME}")
+        logger.error(f"Timeout fetching RabbitMQ management stats for queue {RABBITMQ_CONSUME_QUEUE_NAME}")
     return rates
 
 # --- Main Execution (for Uvicorn) ---

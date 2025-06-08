@@ -82,17 +82,23 @@ def publish_to_rabbitmq(camera_id: str, metadata: ChunkMetadata):
 
     try:
         channel = connection.channel()
-        queue_name = f"ai.camera.{camera_id}"
-        channel.queue_declare(queue=queue_name, durable=True)
-        logger.info(f"[{camera_id}] Ensured RabbitMQ queue '{queue_name}' exists.")
+        exchange_name = 'ai_camera_exchange'
+        routing_key = f"ai.camera.{camera_id}"
+
+        # Declare a topic exchange, durable so it survives broker restarts
+        channel.exchange_declare(exchange=exchange_name, exchange_type='topic', durable=True)
+        logger.info(f"[{camera_id}] Ensured RabbitMQ exchange '{exchange_name}' of type 'topic' exists.")
 
         channel.basic_publish(
-            exchange='',
-            routing_key=queue_name,
+            exchange=exchange_name,
+            routing_key=routing_key,
             body=metadata.to_json(),
-            properties=BasicProperties(delivery_mode=2)
+            properties=BasicProperties(
+                delivery_mode=2,  # make message persistent
+                content_type='application/json'
+            )
         )
-        logger.info(f"[{camera_id}] Successfully published metadata to RabbitMQ queue '{queue_name}': {metadata.chunk_url}")
+        logger.info(f"[{camera_id}] Successfully published metadata to exchange '{exchange_name}' with routing key '{routing_key}': {metadata.chunk_url}")
     except Exception as e:
         logger.error(f"[{camera_id}] Error publishing to RabbitMQ: {e}")
     finally:

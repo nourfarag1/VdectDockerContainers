@@ -78,7 +78,6 @@ services:
       dockerfile: Dockerfile
     environment:
       PYTHONUNBUFFERED: "1"
-      CAMERA_ID_TO_PROCESS: "5233342f-bf17-43b6-93a9-7910b5bbaf94"
       RABBITMQ_HOST: "rabbitmq"
       RABBITMQ_USER: "Noureldin"
       RABBITMQ_PASSWORD: "Nour123#"
@@ -105,7 +104,6 @@ services:
       RABBITMQ_HOST: "rabbitmq"
       RABBITMQ_USER: "Noureldin"
       RABBITMQ_PASSWORD: "Nour123#"
-      CAMERA_ID_TO_PROCESS: "5233342f-bf17-43b6-93a9-7910b5bbaf94"
       MINIO_URL: "minio:9000"
       MINIO_ACCESS_KEY: "Noureldin"
       MINIO_SECRET_KEY: "Nour123#"
@@ -118,30 +116,6 @@ services:
     networks:
       - app-network
     # restart: unless-stopped # Optional
-
-    # dummy-ai-worker2:
-    #   container_name: dummy-ai-worker2
-    #   build:
-    #     context: ./Microservices/DummyAiWorker
-    #     dockerfile: Dockerfile
-    #   environment:
-    #     PYTHONUNBUFFERED: "1"
-    #     RABBITMQ_HOST: "rabbitmq"
-    #     RABBITMQ_USER: "Noureldin"
-    #     RABBITMQ_PASSWORD: "Nour123#"
-    #     CAMERA_ID_TO_PROCESS: "4b34893d-d9ef-445c-aebf-71ae142051ec"
-    #     MINIO_URL: "minio:9000"
-    #     MINIO_ACCESS_KEY: "Noureldin"
-    #     MINIO_SECRET_KEY: "Nour123#"
-    #     MINIO_USE_SECURE: "False"
-    #   ports:
-    #     - "8002:8000"
-    #   depends_on:
-    #     - rabbitmq
-    #     - minio
-    #   networks:
-    #     - app-network
-    #   # restart: unless-stopped # Optional
 
 volumes:
   minio-data:
