@@ -201,7 +201,7 @@ def rabbitmq_consumer_thread_func():
             connection = pika.BlockingConnection(pika.ConnectionParameters(host=RABBITMQ_HOST, credentials=credentials, heartbeat=600))
             channel = connection.channel()
             exchange_name = 'ai_results_exchange'
-            channel.exchange_declare(exchange=exchange_name, exchange_type='topic')
+            channel.exchange_declare(exchange=exchange_name, exchange_type='topic', durable=True)
             result = channel.queue_declare(queue='', exclusive=True)
             queue_name = result.method.queue
             binding_key = "ai.results.*" 
