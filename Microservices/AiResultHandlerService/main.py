@@ -101,6 +101,36 @@ def generate_thumbnail(video_path, thumbnail_filename):
         logging.error(f"Error generating thumbnail for {video_path}: {e}")
         return False
 
+def publish_event_notification(notification_data: dict):
+    """Publishes a final event notification to RabbitMQ for the backend to consume."""
+    connection = None
+    try:
+        credentials = pika.PlainCredentials(RABBITMQ_USER, RABBITMQ_PASSWORD)
+        connection = pika.BlockingConnection(pika.ConnectionParameters(host=RABBITMQ_HOST, credentials=credentials))
+        channel = connection.channel()
+
+        exchange_name = 'event_notifications_exchange'
+        channel.exchange_declare(exchange=exchange_name, exchange_type='topic', durable=True)
+
+        routing_key = f"events.violence.{notification_data.get('camera_id', 'unknown')}"
+        message_body = json.dumps(notification_data)
+
+        channel.basic_publish(
+            exchange=exchange_name,
+            routing_key=routing_key,
+            body=message_body,
+            properties=pika.BasicProperties(
+                delivery_mode=2,  # make message persistent
+                content_type='application/json'
+            ))
+        logging.info(f"Successfully published event notification to exchange '{exchange_name}' with key '{routing_key}'")
+
+    except Exception as e:
+        logging.error(f"Failed to publish event notification: {e}")
+    finally:
+        if connection and connection.is_open:
+            connection.close()
+
 def combine_chunks_and_upload(camera_id, chunks_to_process):
     logging.info(f"[{camera_id}] Combining {len(chunks_to_process)} chunks for processing.")
     local_chunk_paths = [path for chunk in chunks_to_process if (path := download_chunk(chunk['object_name'])) is not None]
@@ -121,20 +151,40 @@ def combine_chunks_and_upload(camera_id, chunks_to_process):
     try:
         subprocess.run(['ffmpeg', '-f', 'concat', '-safe', '0', '-i', file_list_path, '-c', 'copy', output_path, '-y'], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         logging.info(f"[{camera_id}] Successfully combined video: {output_filename}")
+        
         minio_client.fput_object(PROCESSED_VIDEO_BUCKET, output_filename, output_path)
-        logging.info(f"[{camera_id}] Uploaded combined video to MinIO bucket '{PROCESSED_VIDEO_BUCKET}'.")
+        incident_video_url = f"http://{MINIO_URL}/{PROCESSED_VIDEO_BUCKET}/{output_filename}"
+        logging.info(f"[{camera_id}] Uploaded combined video to MinIO: {incident_video_url}")
 
         thumbnail_filename = output_filename.replace('.mp4', '.jpg')
+        thumbnail_url = ""
         if generate_thumbnail(output_path, thumbnail_filename):
-            minio_client.fput_object(THUMBNAIL_BUCKET, thumbnail_filename, os.path.join(LOCAL_THUMBNAIL_DIR, thumbnail_filename))
-            logging.info(f"Uploaded thumbnail to MinIO: {thumbnail_filename}")
+            thumbnail_local_path = os.path.join(LOCAL_THUMBNAIL_DIR, thumbnail_filename)
+            minio_client.fput_object(THUMBNAIL_BUCKET, thumbnail_filename, thumbnail_local_path)
+            thumbnail_url = f"http://{MINIO_URL}/{THUMBNAIL_BUCKET}/{thumbnail_filename}"
+            logging.info(f"Uploaded thumbnail to MinIO: {thumbnail_url}")
 
+        # --- Update UI and Publish Notification ---
+        event_timestamp = datetime.now()
+        
+        # 1. Update local UI state
         with data_lock:
             detected_events.append({
-                'camera_id': camera_id, 'timestamp': datetime.now().isoformat(),
+                'camera_id': camera_id, 'timestamp': event_timestamp.isoformat(),
                 'video_filename': output_filename, 'video_url': f'/videos/{output_filename}',
                 'thumbnail_url': f'/thumbnails/{thumbnail_filename}'
             })
+
+        # 2. Publish notification for the backend
+        notification_payload = {
+            "camera_id": camera_id,
+            "event_type": "violence_detected",
+            "event_timestamp_utc": event_timestamp.strftime('%Y-%m-%dT%H:%M:%SZ'),
+            "incident_video_url": incident_video_url,
+            "thumbnail_url": thumbnail_url,
+            "message_version": "1.0"
+        }
+        publish_event_notification(notification_payload)
 
     except subprocess.CalledProcessError as e:
         logging.error(f"[{camera_id}] FFmpeg failed during chunk combination: {e.stderr.decode()}")
