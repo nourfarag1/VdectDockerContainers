@@ -231,7 +231,7 @@ def rabbitmq_consumer_thread_func():
             # Bind the queue to the exchange with our wildcard routing key
             channel.queue_bind(exchange=RABBITMQ_CONSUME_EXCHANGE_NAME, queue=RABBITMQ_CONSUME_QUEUE_NAME, routing_key=RABBITMQ_CONSUME_BINDING_KEY)
             logger.info(f"Bound queue '{RABBITMQ_CONSUME_QUEUE_NAME}' to exchange '{RABBITMQ_CONSUME_EXCHANGE_NAME}' with key '{RABBITMQ_CONSUME_BINDING_KEY}'")
-            
+
             # Declare the exchange we will publish results to
             channel.exchange_declare(exchange=RABBITMQ_RESULTS_EXCHANGE_NAME, exchange_type='topic', durable=True)
             logger.info(f"Declared exchange '{RABBITMQ_RESULTS_EXCHANGE_NAME}' for publishing results.")
