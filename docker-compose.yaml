@@ -18,7 +18,9 @@ services:
         sleep 5
         mc alias set myminio http://localhost:9000 Noureldin "Nour123#"
         mc mb myminio/processed-videos || true
+        mc mb myminio/thumbnails || true
         mc anonymous set download myminio/processed-videos
+        mc anonymous set download myminio/thumbnails
         wait
     networks:
       - app-network
