@@ -10,7 +10,16 @@ services:
     environment:
       MINIO_ROOT_USER: Noureldin
       MINIO_ROOT_PASSWORD: "Nour123#" # QUOTED
-    command: server --console-address ":9001" /data
+    entrypoint:
+      - sh
+      - -c
+      - |
+        minio server --console-address ":9001" /data &
+        sleep 5
+        mc alias set myminio http://localhost:9000 Noureldin "Nour123#"
+        mc mb myminio/processed-videos || true
+        mc anonymous set download myminio/processed-videos
+        wait
     networks:
       - app-network
 
