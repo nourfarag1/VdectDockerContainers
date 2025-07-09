@@ -5,4 +5,5 @@ requests>=2.20.0,<3.0.0 # For simple HTTP GET for MinIO or other needs
 fastapi>=0.90.0,<1.0.0
 uvicorn[standard]>=0.20.0,<1.0.0
 aiohttp
+psutil
 # We might add more later, e.g., for more sophisticated stats reporting 
