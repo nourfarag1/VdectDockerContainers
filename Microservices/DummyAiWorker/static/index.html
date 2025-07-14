@@ -221,6 +221,23 @@
             </div>
         </div>
 
+        <h2>Total Chunk Processing Time with Trend (Last <span id="trend_chart_points_display">N</span> Chunks)</h2>
+        <div class="stats-grid">
+            <div class="stat-item" style="grid-column: 1 / -1; height: 400px;"> <!-- Span full width and increase height -->
+                <h3>
+                    <span>Total Processing Time (ms) with Linear Trendline
+                        <span class="info-icon-container">
+                            <span class="info-icon">&#9432;</span>
+                            <span class="tooltip-text">A scatter plot showing the total processing time for each recent chunk, with a linear trendline to indicate performance changes over time. Time is in milliseconds.</span>
+                        </span>
+                    </span>
+                </h3>
+                <div class="chart-container" style="height: 300px;"> <!-- Adjust chart container height -->
+                    <canvas id="totalProcessingTimeTrendChart"></canvas>
+                </div>
+            </div>
+        </div>
+
         <h2>Recent Chunk Processing (Last <span id="max_recent_stats_display">N</span>)
             <span class="info-icon-container">
                 <span class="info-icon">&#9432;</span>
@@ -233,7 +250,7 @@
     </div>
 
     <script>
-        let rabbitmqChartInstance, minioChartInstance, workerChartInstance;
+        let rabbitmqChartInstance, minioChartInstance, workerChartInstance, totalProcessingTimeTrendChartInstance;
         const MAX_CHART_POINTS = 20; // Max data points to show on time-series charts
         const CHART_TEXT_COLOR = '#E0E0E0'; // Light color for chart text, labels, ticks
 
@@ -322,6 +339,82 @@
                 options: {...genericOptions, plugins: { ...genericOptions.plugins, title: { display: false, text: 'Worker Processing Times', color: CHART_TEXT_COLOR }}}
             });
             document.getElementById('worker_chart_points_display').textContent = MAX_CHART_POINTS;
+
+            const trendCtx = document.getElementById('totalProcessingTimeTrendChart').getContext('2d');
+            totalProcessingTimeTrendChartInstance = new Chart(trendCtx, {
+                type: 'scatter',
+                data: {
+                    datasets: [
+                        {
+                            label: 'Total Processing Time (s)',
+                            data: [],
+                            backgroundColor: 'rgba(255, 99, 132, 0.6)', // Red for scatter points
+                            borderColor: 'rgba(255, 99, 132, 1)',
+                            pointRadius: 4,
+                            pointHoverRadius: 6
+                        },
+                        {
+                            label: 'Trendline',
+                            data: [],
+                            type: 'line', // This dataset will be a line
+                            borderColor: '#4CAF50', // Green for trendline
+                            backgroundColor: 'rgba(0,0,0,0)', // Transparent fill
+                            borderWidth: 2,
+                            pointRadius: 0, // No points for the trendline
+                            fill: false
+                        }
+                    ]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    scales: {
+                        x: {
+                            type: 'linear', // Use linear scale for scatter plot
+                            position: 'bottom',
+                            title: {
+                                display: true,
+                                text: 'Chunk Index', // Or time, depending on how you want to represent it
+                                color: CHART_TEXT_COLOR
+                            },
+                            ticks: { color: CHART_TEXT_COLOR },
+                            grid: { color: 'rgba(224, 224, 224, 0.1)' }
+                        },
+                        y: {
+                            beginAtZero: true,
+                            title: {
+                                display: true,
+                                text: 'Time (s)',
+                                color: CHART_TEXT_COLOR
+                            },
+                            ticks: { color: CHART_TEXT_COLOR },
+                            grid: { color: 'rgba(224, 224, 224, 0.1)' }
+                        }
+                    },
+                    plugins: {
+                        legend: { labels: { color: CHART_TEXT_COLOR } },
+                        title: { display: false, text: 'Total Processing Time Trend', color: CHART_TEXT_COLOR }
+                    },
+                    // Tooltip for scatter plot to show x (index) and y (time)
+                    tooltip: {
+                        callbacks: {
+                            label: function(context) {
+                                let label = context.dataset.label || '';
+                                if (label) {
+                                    label += ': ';
+                                }
+                                if (context.dataset.type === 'scatter') {
+                                    label += `(Chunk ${context.parsed.x}, ${context.parsed.y.toFixed(2)}s)`;
+                                } else {
+                                    label += `${context.parsed.y.toFixed(2)}s`;
+                                }
+                                return label;
+                            }
+                        }
+                    }
+                }
+            });
+            document.getElementById('trend_chart_points_display').textContent = MAX_CHART_POINTS;
         }
 
         let timestamps = []; // For RabbitMQ chart x-axis - can be used if needed for more precise time
@@ -350,15 +443,45 @@
                 // Shorten labels for charts, using timestamp as a simple unique ID for the x-axis
                 const chartLabels = recentChunks.map(chunk => new Date(chunk.received_at * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }));
                 
-                const minioDownloadData = recentChunks.map(chunk => chunk.download_duration_s);
+                const minioDownloadData = recentChunks.map(chunk => chunk.download_duration_ms / 1000); // Convert ms to seconds
                 minioChartInstance.data.labels = chartLabels;
                 minioChartInstance.data.datasets[0].data = minioDownloadData;
+                minioChartInstance.options.scales.y.title.text = 'Download Duration (s)'; // Update Y-axis title
                 minioChartInstance.update('none');
 
-                const workerTotalTimeData = recentChunks.map(chunk => chunk.total_worker_time_s);
+                const workerTotalTimeData = recentChunks.map(chunk => chunk.total_worker_time_ms / 1000); // Convert ms to seconds
                 workerChartInstance.data.labels = chartLabels; 
                 workerChartInstance.data.datasets[0].data = workerTotalTimeData;
+                workerChartInstance.options.scales.y.title.text = 'Total Worker Time (s)'; // Update Y-axis title
                 workerChartInstance.update('none');
+            }
+
+            // Total Processing Time Trend Chart
+            if (totalProcessingTimeTrendChartInstance && statsData.recent_chunk_stats) {
+                const recentChunks = statsData.recent_chunk_stats;
+                const totalWorkerTimesInSeconds = recentChunks.map(chunk => chunk.total_worker_time_ms / 1000);
+                
+                const scatterData = totalWorkerTimesInSeconds.map((time, index) => ({ x: index, y: time }));
+                totalProcessingTimeTrendChartInstance.data.datasets[0].data = scatterData;
+
+                // Generate trendline data based on the returned slope and intercept
+                const slope = statsData.total_processing_time_trend.slope / 1000; // Slope is in ms, convert to seconds
+                const intercept = statsData.total_processing_time_trend.intercept / 1000; // Intercept is in ms, convert to seconds
+
+                if (recentChunks.length > 1) {
+                    const trendlineData = [];
+                    // Calculate start and end points for the trendline
+                    const minX = 0;
+                    const maxX = recentChunks.length - 1;
+
+                    trendlineData.push({ x: minX, y: slope * minX + intercept });
+                    trendlineData.push({ x: maxX, y: slope * maxX + intercept });
+
+                    totalProcessingTimeTrendChartInstance.data.datasets[1].data = trendlineData;
+                } else {
+                    totalProcessingTimeTrendChartInstance.data.datasets[1].data = []; // Clear trendline if not enough data
+                }
+                totalProcessingTimeTrendChartInstance.update('none');
             }
         }
 
@@ -410,9 +533,9 @@
                                 <strong>Chunk:</strong> <span title="${chunk.chunk_url}">${chunkName}</span> <br>
                                 <small>
                                 <strong>Received:</strong> ${new Date(chunk.received_at * 1000).toLocaleString()} | 
-                                <strong>Download:</strong> ${chunk.download_duration_s}s | 
-                                <strong>AI Sim:</strong> ${chunk.simulated_processing_s}s | 
-                                <strong>Total Worker:</strong> ${chunk.total_worker_time_s}s
+                                <strong>Download:</strong> ${(chunk.download_duration_ms / 1000).toFixed(2)}s | 
+                                <strong>AI Proc:</strong> ${(chunk.ai_processing_time_ms / 1000).toFixed(2)}s | 
+                                <strong>Total Worker:</strong> ${(chunk.total_worker_time_ms / 1000).toFixed(2)}s
                                 ${aiResultDisplay}
                                 </small>
                             `;

@@ -119,6 +119,7 @@ services:
       MINIO_ACCESS_KEY: "Noureldin"
       MINIO_SECRET_KEY: "Nour123#"
       MINIO_USE_SECURE: "False"
+      VDECT_AI_MODEL_URL: "http://host.docker.internal:5004" # New: Point to host-based AI model
     ports:
       - "8001:8000"
     depends_on:
@@ -126,12 +127,19 @@ services:
       - minio
     networks:
       - app-network
-    # restart: unless-stopped # Optional
+    volumes:
+      - shared-video-data:/shared_videos # Mount the shared volume into the container
+    restart: unless-stopped # Optional
 
 volumes:
   minio-data:
   rabbitmq-data:
-
+  shared-video-data: # New named volume for shared video chunks
+    driver: local
+    driver_opts:
+      o: bind
+      type: none
+      device: N:\College\GraduationProject\Code\Development\shared_video_processing # Host path
 
 networks:
   app-network:

@@ -6,4 +6,5 @@ fastapi>=0.90.0,<1.0.0
 uvicorn[standard]>=0.20.0,<1.0.0
 aiohttp
 psutil
+numpy # New: For linear regression
 # We might add more later, e.g., for more sophisticated stats reporting 
