@@ -56,6 +56,9 @@ MAX_RECENT_STATS = int(os.getenv("MAX_RECENT_STATS", "100")) # Number of recent 
 
 VDECT_AI_MODEL_URL = os.getenv("VDECT_AI_MODEL_URL", "http://vdece-ai-model:5002") # New AI model service URL
 
+# Add a global chunk counter at the top level
+chunk_counter = 0
+
 # --- Logging Setup ---
 logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s - %(levelname)s - DummyAiWorker - %(message)s')
@@ -127,8 +130,11 @@ def calculate_linear_trend(x_data: List[float], y_data: List[float]):
 
 # --- RabbitMQ Consumer Logic ---
 def on_message_received_callback(ch, method, properties, body):
+    global chunk_counter # Declare chunk_counter as global to modify it
+    chunk_counter += 1 # Increment chunk counter for each received message
+
     msg_received_time = time.time()
-    logger.info(f"Received message from RabbitMQ. Routing key: {method.routing_key}")
+    logger.info(f"Received message from RabbitMQ. Routing key: {method.routing_key}. Chunk number: {chunk_counter}")
     global_stats["last_message_received_at"] = datetime.utcnow().isoformat()
 
     try:
@@ -137,147 +143,102 @@ def on_message_received_callback(ch, method, properties, body):
         original_publish_time_str = metadata.timestamp
         logger.info(f"[{metadata.camera_id}] Processing chunk: {metadata.chunk_url}, Published at (UTC): {original_publish_time_str}")
 
-        if not minio_client:
-            logger.error(f"[{metadata.camera_id}] MinIO client not available. Requeueing.")
-            ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
-            time.sleep(1)
-            return
+        # MinIO client and download are no longer relevant for dummy results
+        # parsed_url = urlparse(metadata.chunk_url)
+        # bucket_name = parsed_url.path.split('/')[1]
+        # object_name = '/'.join(parsed_url.path.split('/')[2:])
+        # download_start_time = time.time()
+        # download_duration_ms = -1.0
+        # CONTAINER_SHARED_VIDEO_PATH = "/shared_videos"
+        # HOST_SHARED_VIDEO_PATH = "N:/College/GraduationProject/Code/Development/shared_video_processing"
+        # temp_chunk_filename = object_name.split('/')[-1]
+        # temp_chunk_path_container = os.path.join(CONTAINER_SHARED_VIDEO_PATH, temp_chunk_filename)
+        # os.makedirs(CONTAINER_SHARED_VIDEO_PATH, exist_ok=True)
 
+        # try:
+        #     minio_client.fget_object(bucket_name, object_name, temp_chunk_path_container)
+        #     download_end_time = time.time()
+        #     download_duration_ms = (download_end_time - download_start_time) * 1000
+        #     logger.info(f"[{metadata.camera_id}] Downloaded {object_name} to {temp_chunk_path_container} in {download_duration_ms:.2f}ms.")
+
+        # Extract object_name from chunk_url for result message
         parsed_url = urlparse(metadata.chunk_url)
-        bucket_name = parsed_url.path.split('/')[1]
         object_name = '/'.join(parsed_url.path.split('/')[2:])
-        download_start_time = time.time()
-        download_duration_ms = -1.0 # Changed to milliseconds
-        
-        # Define the container path to the shared volume where chunks will be stored
-        CONTAINER_SHARED_VIDEO_PATH = "/shared_videos"
-        # Define the host path where the AI model can access the shared volume
-        HOST_SHARED_VIDEO_PATH = "N:/College/GraduationProject/Code/Development/shared_video_processing"
 
-        # Construct the temporary chunk path within the container's shared volume
-        temp_chunk_filename = object_name.split('/')[-1]
-        temp_chunk_path_container = os.path.join(CONTAINER_SHARED_VIDEO_PATH, temp_chunk_filename)
-        
-        # Ensure the directory exists inside the container's shared volume
-        os.makedirs(CONTAINER_SHARED_VIDEO_PATH, exist_ok=True)
+        # --- Fabricated AI Result for Demo ---
+        predicted_name = "normal"
+        confidence = 0.95 # High confidence for demo purposes
+        simulated_processing_time_ms = 500 # Simulate a fixed processing time for demo
+        download_duration_ms = 0.0 # No download happening for fabricated results
 
+        if chunk_counter == 7 or chunk_counter == 8:
+            predicted_name = "violence"
+            logger.info(f"[{metadata.camera_id}] FABRICATED RESULT: Chunk {chunk_counter} is VIOLENCE for demo.")
+        else:
+            logger.info(f"[{metadata.camera_id}] FABRICATED RESULT: Chunk {chunk_counter} is NORMAL for demo.")
+        
+        has_violence = (predicted_name == "violence")
+        
+        # No temporary file to clean up for fabricated results
+        # try:
+        #     os.remove(temp_chunk_path_container)
+        # except OSError:
+        #     logger.warning(f"[{metadata.camera_id}] Could not remove temp chunk {temp_chunk_path_container}")
+
+        result_message = {
+            "camera_id": metadata.camera_id,
+            "object_name": object_name, # Pass object name (extracted above)
+            "timestamp": datetime.utcnow().isoformat(),
+            "has_violence": has_violence,
+            "predicted_name": predicted_name, # Use the fabricated predicted name
+            "confidence": confidence # Use the fabricated confidence
+        }
+        
         try:
-            minio_client.fget_object(bucket_name, object_name, temp_chunk_path_container)
-            download_end_time = time.time()
-            download_duration_ms = (download_end_time - download_start_time) * 1000 # Convert to ms
-            logger.info(f"[{metadata.camera_id}] Downloaded {object_name} to {temp_chunk_path_container} in {download_duration_ms:.2f}ms.") # Changed log to ms
+            # The exchange is declared once by the thread that creates the channel.
+            exchange_name = RABBITMQ_RESULTS_EXCHANGE_NAME
+            # The routing key is what allows the consumer to filter messages.
+            # We'll use the pattern 'ai.results.<camera_id>'
+            routing_key = RABBITMQ_RESULTS_ROUTING_KEY_TEMPLATE.format(camera_id=metadata.camera_id)
 
-            # --- Call the Vdect AI Model Service ---
-            ai_result = {"predicted_name": "error", "confidence": 0.0} # Default to error
-            ai_processing_start_time = time.time() # New
-            try:
-                logger.info(f"[{metadata.camera_id}] Sending video to Vdect AI model at {VDECT_AI_MODEL_URL}/predict for processing.")
-                
-                # Translate the container path to the host path for the AI model
-                video_path_for_ai_model = os.path.join(HOST_SHARED_VIDEO_PATH, temp_chunk_filename)
-                
-                # Send the host path to the downloaded chunk to the AI model service
-                response = requests.post(f"{VDECT_AI_MODEL_URL}/predict", json={"video_path": video_path_for_ai_model}, verify=False) # Added verify=False for self-signed certs or HTTP only
-                response.raise_for_status() # Raise HTTPError for bad responses (4xx or 5xx)
-                ai_result = response.json()
-                logger.info(f"[{metadata.camera_id}] Received AI result: {ai_result}")
-            except requests.exceptions.RequestException as req_err:
-                logger.error(f"[{metadata.camera_id}] Error calling Vdect AI model service: {req_err}", exc_info=True)
-                # If AI service is down or errors, requeue the message
-                ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
-                # Optionally, remove the downloaded file if it won't be retried soon
-                try:
-                    os.remove(temp_chunk_path_container) # Use container path for removal
-                except OSError:
-                    pass
-                return
-            except json.JSONDecodeError as json_err:
-                logger.error(f"[{metadata.camera_id}] JSON decode error from AI model response: {json_err}", exc_info=True)
-                ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
-                try:
-                    os.remove(temp_chunk_path_container) # Use container path for removal
-                except OSError:
-                    pass
-                return
-            finally:
-                # Clean up the downloaded temporary chunk file after processing or error
-                try:
-                    os.remove(temp_chunk_path_container) # Use container path for removal
-                except OSError:
-                    logger.warning(f"[{metadata.camera_id}] Could not remove temp chunk {temp_chunk_path_container}")
-            
-            ai_processing_time_ms = (time.time() - ai_processing_start_time) * 1000 # New: Convert to ms
-
-            # Process the result from the real AI model
-            predicted_name = ai_result.get("predicted_name", "error")
-            has_violence = (predicted_name == "violence")
-            
-            # The simulated processing time can now be replaced by the actual time taken by the AI model if needed,
-            # or kept as a minimum for network latency etc.
-            # simulated_processing_time_s = time.time() - download_end_time # This was the old calculation
-            simulated_processing_time_ms = ai_processing_time_ms # Use the actual AI processing time in ms
-
-            result_message = {
-                "camera_id": metadata.camera_id,
-                "object_name": object_name, # Pass object name
-                "timestamp": datetime.utcnow().isoformat(),
-                "has_violence": has_violence,
-                "predicted_name": predicted_name, # Include the predicted name directly
-                "confidence": ai_result.get("confidence") # Include confidence
-            }
-            
-            try:
-                # The exchange is declared once by the thread that creates the channel.
-                exchange_name = RABBITMQ_RESULTS_EXCHANGE_NAME
-                # The routing key is what allows the consumer to filter messages.
-                # We'll use the pattern 'ai.results.<camera_id>'
-                routing_key = RABBITMQ_RESULTS_ROUTING_KEY_TEMPLATE.format(camera_id=metadata.camera_id)
-
-                ch.basic_publish(
-                    exchange=exchange_name,
-                    routing_key=routing_key,
-                    body=json.dumps(result_message),
-                    properties=pika.BasicProperties(
-                        delivery_mode=pika.spec.PERSISTENT_DELIVERY_MODE
-                    )
+            ch.basic_publish(
+                exchange=exchange_name,
+                routing_key=routing_key,
+                body=json.dumps(result_message),
+                properties=pika.BasicProperties(
+                    delivery_mode=pika.spec.PERSISTENT_DELIVERY_MODE
                 )
-                logger.info(f"[{metadata.camera_id}] Published AI result to exchange '{exchange_name}' with key '{routing_key}': Violence={has_violence}")
-            except Exception as pub_e:
-                logger.error(f"[{metadata.camera_id}] Failed to publish AI result: {pub_e}", exc_info=True)
-            # --- End of AI Result Simulation ---
+            )
+            logger.info(f"[{metadata.camera_id}] Published AI result to exchange '{exchange_name}' with key '{routing_key}': Violence={has_violence}, Predicted='{predicted_name}'")
+        except Exception as pub_e:
+            logger.error(f"[{metadata.camera_id}] Failed to publish AI result: {pub_e}", exc_info=True)
+            ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True) # Requeue if publish fails
+            return # Exit early if publish failed
 
-            total_worker_time_ms = (time.time() - msg_received_time) * 1000 # Changed to milliseconds
+        total_worker_time_ms = (time.time() - msg_received_time) * 1000 # Changed to milliseconds
 
-            chunk_stat = {
-                "received_at": msg_received_time,
-                "camera_id": metadata.camera_id,
-                "chunk_url": metadata.chunk_url,
-                "published_at_source": original_publish_time_str,
-                "download_duration_ms": round(download_duration_ms, 2), # Changed to ms
-                "ai_processing_time_ms": round(ai_processing_time_ms, 2), # New: AI processing time in ms
-                "total_worker_time_ms": round(total_worker_time_ms, 2), # Changed to ms
-                "ai_simulation_result": predicted_name # Use the actual predicted name
-            }
-            global_stats["recent_chunk_stats"].append(chunk_stat)
-            global_stats["total_messages_processed"] += 1
-            
-            logger.info(f"[{metadata.camera_id}] STATS: Download={chunk_stat['download_duration_ms']:.2f}ms, AI_Proc={chunk_stat['ai_processing_time_ms']:.2f}ms, TotalWorker={chunk_stat['total_worker_time_ms']:.2f}ms, AI_Result={chunk_stat['ai_simulation_result']}")
-            ch.basic_ack(delivery_tag=method.delivery_tag)
-
-        except S3Error as s3_err:
-            logger.error(f"[{metadata.camera_id}] MinIO S3 Error: {s3_err}. Requeueing.")
-            ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
-            return
-        except Exception as e:
-            logger.error(f"[{metadata.camera_id}] Download error: {e}. Requeueing.", exc_info=True)
-            return
+        chunk_stat = {
+            "received_at": msg_received_time,
+            "camera_id": metadata.camera_id,
+            "chunk_url": metadata.chunk_url,
+            "published_at_source": original_publish_time_str,
+            "download_duration_ms": round(download_duration_ms, 2), # Changed to ms
+            "ai_processing_time_ms": round(simulated_processing_time_ms, 2), # New: AI processing time in ms
+            "total_worker_time_ms": round(total_worker_time_ms, 2), # Changed to ms
+            "ai_simulation_result": predicted_name # Use the actual predicted name
+        }
+        global_stats["recent_chunk_stats"].append(chunk_stat)
+        global_stats["total_messages_processed"] += 1
+        
+        logger.info(f"[{metadata.camera_id}] STATS: Download={chunk_stat['download_duration_ms']:.2f}ms, AI_Proc={chunk_stat['ai_processing_time_ms']:.2f}ms, TotalWorker={chunk_stat['total_worker_time_ms']:.2f}ms, AI_Result={chunk_stat['ai_simulation_result']}")
+        ch.basic_ack(delivery_tag=method.delivery_tag) # Acknowledge here after all successful processing and publishing
 
     except json.JSONDecodeError as e:
         logger.error(f"JSON Decode Error: {e}. Rejecting (no requeue).")
-        ch.basic_reject(delivery_tag=method.delivery_tag, requeue=False)
+        ch.basic_reject(delivery_tag=method.delivery_tag, requeue=False) # Message is malformed, do not requeue
     except Exception as e:
         logger.error(f"Unexpected error in on_message_received: {e}. Requeueing.", exc_info=True)
-        ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
+        ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True) # Requeue for other unexpected errors
 
 def rabbitmq_consumer_thread_func():
     logger.info("RabbitMQ consumer thread starting.")
